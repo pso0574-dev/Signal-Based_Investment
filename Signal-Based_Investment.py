@@ -1,15 +1,12 @@
-# signal_dashboard_fred_api.py
+# signal_dashboard_fred_api_fixed.py
 # Run:
-#   streamlit run signal_dashboard_fred_api.py
+#   streamlit run signal_dashboard_fred_api_fixed.py
 #
 # Install:
 #   pip install streamlit pandas numpy requests plotly yfinance beautifulsoup4 lxml
 
 import os
 import re
-import io
-from datetime import datetime, timedelta
-
 import numpy as np
 import pandas as pd
 import requests
@@ -146,19 +143,11 @@ def portfolio_bias_from_score(score: int, inflation_signal: int) -> dict:
 
     return normalize_weights(w)
 
-
 # --------------------------------------------------
 # FRED API Loader
 # --------------------------------------------------
 @st.cache_data(ttl=60 * 60)
-def load_fred_series_api(
-    series_id: str,
-    api_key: str,
-    observation_start: str = "2000-01-01"
-) -> pd.Series:
-    """
-    Load a FRED series using the official FRED API.
-    """
+def load_fred_series_api(series_id: str, api_key: str, observation_start: str = "2000-01-01") -> pd.Series:
     params = {
         "series_id": series_id,
         "api_key": api_key,
@@ -207,7 +196,6 @@ def load_all_fred_api(api_key: str, observation_start: str = "2000-01-01") -> pd
 
     return pd.concat(frames, axis=1).sort_index()
 
-
 # --------------------------------------------------
 # GDPNow Scraper
 # --------------------------------------------------
@@ -236,7 +224,6 @@ def fetch_gdpnow():
             "quarter": "",
         }
 
-
 # --------------------------------------------------
 # Market Data Loader
 # --------------------------------------------------
@@ -253,7 +240,6 @@ def load_market_data(tickers: list[str], period: str = "10y") -> pd.DataFrame:
         close = data.copy()
 
     return close.dropna(how="all")
-
 
 # --------------------------------------------------
 # Feature Engineering
@@ -279,14 +265,12 @@ def prepare_macro_features(fred: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 # --------------------------------------------------
 # Signal Engine
 # --------------------------------------------------
 def compute_category_scores(df: pd.DataFrame, gdpnow_value: float | None = None) -> dict:
     latest = df.ffill().iloc[-1]
 
-    # Liquidity
     liq = 0
     if pd.notna(latest["WALCL_13W_PCT"]):
         liq += 1 if latest["WALCL_13W_PCT"] > 1.0 else -1
@@ -294,7 +278,6 @@ def compute_category_scores(df: pd.DataFrame, gdpnow_value: float | None = None)
         liq += 1 if latest["NFCI"] < 0 else -1
     liquidity_score = 1 if liq >= 1 else (-1 if liq <= -1 else 0)
 
-    # Growth
     growth = 0
     if pd.notna(latest["UNRATE_6M_DELTA"]):
         growth += 1 if latest["UNRATE_6M_DELTA"] <= 0.0 else -1
@@ -304,7 +287,6 @@ def compute_category_scores(df: pd.DataFrame, gdpnow_value: float | None = None)
         growth += 1 if gdpnow_value > 1.5 else (-1 if gdpnow_value < 0.5 else 0)
     growth_score = 1 if growth >= 1 else (-1 if growth <= -1 else 0)
 
-    # Inflation
     inflation = 0
     if pd.notna(latest["CPI_YOY"]):
         inflation += 1 if latest["CPI_YOY"] < 3.0 else -1
@@ -314,7 +296,6 @@ def compute_category_scores(df: pd.DataFrame, gdpnow_value: float | None = None)
         inflation += 1 if latest["T10YIE_13W_DELTA"] <= 0 else -1
     inflation_score = 1 if inflation >= 1 else (-1 if inflation <= -1 else 0)
 
-    # Rates
     rates = 0
     if pd.notna(latest["YC_10Y_2Y"]):
         rates += 1 if latest["YC_10Y_2Y"] > 0 else -1
@@ -324,7 +305,6 @@ def compute_category_scores(df: pd.DataFrame, gdpnow_value: float | None = None)
         rates += 1 if latest["FEDFUNDS_26W_DELTA"] <= 0 else -1
     rates_score = 1 if rates >= 1 else (-1 if rates <= -1 else 0)
 
-    # Stress
     stress = 0
     if pd.notna(latest["NFCI"]):
         stress += 1 if latest["NFCI"] < 0 else -1
@@ -405,14 +385,28 @@ def build_history_scores(df: pd.DataFrame) -> pd.DataFrame:
 
     return pd.DataFrame(rows).set_index("Date")
 
-
 # --------------------------------------------------
 # Plot Functions
 # --------------------------------------------------
 def make_line_chart(df: pd.DataFrame, title: str, yaxis_title: str = ""):
     fig = go.Figure()
+
     for col in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=col))
+        s = df[col].dropna()
+        if s.empty:
+            continue
+
+        fig.add_trace(
+            go.Scatter(
+                x=s.index,
+                y=s.values,
+                mode="lines+markers",
+                name=col,
+                line=dict(width=2),
+                marker=dict(size=4),
+                connectgaps=False
+            )
+        )
 
     fig.update_layout(
         title=title,
@@ -471,7 +465,6 @@ def make_regime_history_chart(hist: pd.DataFrame, price: pd.Series | None = None
     )
     return fig
 
-
 # --------------------------------------------------
 # Sidebar
 # --------------------------------------------------
@@ -503,14 +496,14 @@ with st.spinner("Loading macro data from FRED API..."):
     macro = prepare_macro_features(fred)
 
 gdpnow = fetch_gdpnow() if show_gdpnow else {"value": np.nan, "updated": pd.NaT, "quarter": ""}
-
 market = None
+
 if show_market:
     with st.spinner("Loading ETF market data..."):
         market = load_market_data(list(ETF_TICKERS.keys()), period="10y")
 
 start_date = pd.Timestamp.today().normalize() - pd.Timedelta(days=lookback_days)
-macro_view = macro.loc[macro.index >= start_date].copy()
+macro_view = macro.loc[macro.index >= start_date].copy().sort_index()
 market_view = market.loc[market.index >= start_date].copy() if market is not None else None
 
 scores = compute_category_scores(macro, gdpnow_value=gdpnow["value"])
@@ -588,11 +581,11 @@ with tab2:
     st.subheader("Liquidity Signal")
     l1, l2 = st.columns(2)
 
-    walcl_df = macro_view[["WALCL"]].copy()
+    walcl_df = macro_view[["WALCL"]].copy().ffill()
     walcl_df["WALCL (Trillions)"] = walcl_df["WALCL"] / 1000
-    walcl_df = walcl_df[["WALCL (Trillions)"]]
+    walcl_df = walcl_df[["WALCL (Trillions)"]].dropna()
 
-    nfci_df = macro_view[["NFCI", "ANFCI"]].copy()
+    nfci_df = macro_view[["NFCI", "ANFCI"]].copy().ffill().dropna(how="all")
 
     with l1:
         st.plotly_chart(make_line_chart(walcl_df, "Fed Balance Sheet (WALCL)", "USD Trillions"), use_container_width=True)
@@ -604,10 +597,11 @@ with tab3:
     st.subheader("Growth Signal")
     gcol1, gcol2 = st.columns(2)
 
-    growth_chart_df = macro_view[["UNRATE"]].copy()
-    payroll_chart_df = macro_view[["PAYEMS"]].copy()
+    growth_chart_df = macro_view[["UNRATE"]].copy().ffill().dropna()
+
+    payroll_chart_df = macro_view[["PAYEMS"]].copy().ffill()
     payroll_chart_df["Payrolls (M)"] = payroll_chart_df["PAYEMS"] / 1000
-    payroll_chart_df = payroll_chart_df[["Payrolls (M)"]]
+    payroll_chart_df = payroll_chart_df[["Payrolls (M)"]].dropna()
 
     with gcol1:
         st.plotly_chart(make_line_chart(growth_chart_df, "Unemployment Rate", "%"), use_container_width=True)
@@ -619,8 +613,8 @@ with tab4:
     st.subheader("Inflation Signal")
     i1, i2 = st.columns(2)
 
-    inflation_df = macro_view[["CPI_YOY", "CPI_3M_ANN"]].copy()
-    breakeven_df = macro_view[["T10YIE"]].copy()
+    inflation_df = macro_view[["CPI_YOY", "CPI_3M_ANN"]].copy().ffill().dropna(how="all")
+    breakeven_df = macro_view[["T10YIE"]].copy().ffill().dropna()
 
     with i1:
         st.plotly_chart(make_line_chart(inflation_df, "Inflation Trend", "%"), use_container_width=True)
@@ -632,8 +626,8 @@ with tab5:
     st.subheader("Rates, Curve, and Financial Stress")
     r1, r2 = st.columns(2)
 
-    curve_df = macro_view[["DGS10", "DGS2", "YC_10Y_2Y"]].copy()
-    stress_df = macro_view[["BAMLH0A0HYM2", "DFII10", "FEDFUNDS"]].copy()
+    curve_df = macro_view[["DGS10", "DGS2", "YC_10Y_2Y"]].copy().ffill().dropna(how="all")
+    stress_df = macro_view[["BAMLH0A0HYM2", "DFII10", "FEDFUNDS"]].copy().ffill().dropna(how="all")
 
     with r1:
         st.plotly_chart(make_line_chart(curve_df, "Rates and Yield Curve", "%"), use_container_width=True)
@@ -698,8 +692,8 @@ with tab7:
 st.markdown("---")
 st.markdown("""
 ### Notes
-- This version uses the official FRED API with `file_type=json`.
-- Review frequency should stay low: weekly review, monthly allocation changes.
-- GDPNow scraping can break if the Atlanta Fed page structure changes.
-- The allocation logic is heuristic and should be customized to your own rules.
+- This fixed version handles mixed-frequency FRED series better for charting.
+- Liquidity and Growth plots should now display correctly.
+- Review the dashboard weekly, not daily.
+- Use monthly allocation changes to reduce noise-driven decisions.
 """)
