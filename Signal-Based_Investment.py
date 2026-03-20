@@ -1,699 +1,664 @@
-# signal_dashboard_fred_api_fixed.py
-# Run:
-#   streamlit run signal_dashboard_fred_api_fixed.py
-#
-# Install:
-#   pip install streamlit pandas numpy requests plotly yfinance beautifulsoup4 lxml
-
+# app.py
 import os
-import re
+import math
+import requests
 import numpy as np
 import pandas as pd
-import requests
-import streamlit as st
-import plotly.graph_objects as go
 import yfinance as yf
-from bs4 import BeautifulSoup
+import streamlit as st
+import plotly.express as px
+from datetime import datetime, timedelta
 
-# --------------------------------------------------
-# App Config
-# --------------------------------------------------
+# =========================================================
+# Page config
+# =========================================================
 st.set_page_config(
-    page_title="Signal-Based Investment Dashboard (FRED API)",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="Noise vs Signal Dashboard",
+    page_icon="📊",
+    layout="wide"
 )
 
-# --------------------------------------------------
+# =========================================================
 # Constants
-# --------------------------------------------------
+# =========================================================
+FRED_API_KEY = os.getenv("FRED_API_KEY", "").strip()
 FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 
-FRED_SERIES = {
-    # Liquidity / financial conditions
-    "WALCL": "Fed Balance Sheet",
-    "NFCI": "Chicago Fed NFCI",
-    "ANFCI": "Chicago Fed ANFCI",
+# Market assets (Yahoo Finance)
+MARKET_ASSETS = [
+    {"group": "Equity", "name": "S&P 500 ETF", "symbol": "SPY", "type": "price"},
+    {"group": "Equity", "name": "Nasdaq 100 ETF", "symbol": "QQQ", "type": "price"},
+    {"group": "Equity", "name": "Dow Jones ETF", "symbol": "DIA", "type": "price"},
+    {"group": "Rates Proxy", "name": "20Y Treasury ETF", "symbol": "TLT", "type": "price"},
+    {"group": "Rates Proxy", "name": "7-10Y Treasury ETF", "symbol": "IEF", "type": "price"},
+    {"group": "Inflation / Commodity", "name": "Gold ETF", "symbol": "GLD", "type": "price"},
+    {"group": "Inflation / Commodity", "name": "Oil ETF", "symbol": "USO", "type": "price"},
+    {"group": "Inflation / Commodity", "name": "Broad Commodity ETF", "symbol": "DBC", "type": "price"},
+    {"group": "FX / Dollar", "name": "US Dollar Index ETF", "symbol": "UUP", "type": "price"},
+    {"group": "Risk Asset", "name": "Bitcoin USD", "symbol": "BTC-USD", "type": "price"},
+]
 
-    # Growth
-    "UNRATE": "Unemployment Rate",
-    "PAYEMS": "Nonfarm Payrolls",
+# FRED series
+FRED_SERIES = [
+    {"group": "Rates", "name": "US 10Y Treasury Yield", "symbol": "DGS10", "type": "yield"},
+    {"group": "Rates", "name": "US 2Y Treasury Yield", "symbol": "DGS2", "type": "yield"},
+    {"group": "Rates", "name": "10Y-2Y Spread", "symbol": "T10Y2Y", "type": "spread"},
+    {"group": "Rates", "name": "10Y-3M Spread", "symbol": "T10Y3M", "type": "spread"},
+    {"group": "Real Yield", "name": "10Y Real Yield", "symbol": "DFII10", "type": "yield"},
+    {"group": "Inflation", "name": "Breakeven Inflation 10Y", "symbol": "T10YIE", "type": "yield"},
+    {"group": "Labor", "name": "Unemployment Rate", "symbol": "UNRATE", "type": "macro"},
+    {"group": "Consumption", "name": "Retail Sales", "symbol": "RSAFS", "type": "macro"},
+    {"group": "Liquidity", "name": "M2 Money Supply", "symbol": "M2SL", "type": "macro"},
+    {"group": "Liquidity", "name": "Fed Balance Sheet", "symbol": "WALCL", "type": "macro"},
+]
 
-    # Inflation
-    "CPIAUCSL": "CPI Index",
-    "T10YIE": "10Y Breakeven Inflation",
+# Dashboard groups for first tab
+GROUP_ORDER = [
+    "Equity",
+    "Rates",
+    "Rates Proxy",
+    "Real Yield",
+    "Inflation",
+    "Inflation / Commodity",
+    "Liquidity",
+    "FX / Dollar",
+    "Risk Asset",
+    "Labor",
+    "Consumption",
+]
 
-    # Rates / curve / real yield
-    "DGS10": "US 10Y Yield",
-    "DGS2": "US 2Y Yield",
-    "DFII10": "US 10Y Real Yield",
-    "FEDFUNDS": "Fed Funds Rate",
+# =========================================================
+# Helpers
+# =========================================================
+def fmt_pct(x):
+    if pd.isna(x):
+        return "N/A"
+    return f"{x:+.2f}%"
 
-    # Stress / credit
-    "BAMLH0A0HYM2": "US High Yield OAS",
-}
+def fmt_abs(x):
+    if pd.isna(x):
+        return "N/A"
+    return f"{x:,.2f}"
 
-ETF_TICKERS = {
-    "QQQ": "Nasdaq 100",
-    "TLT": "20+Y Treasury",
-    "TIP": "TIPS ETF",
-    "GLD": "Gold ETF",
-    "DBC": "Commodities ETF",
-    "SPY": "S&P 500",
-}
+def fmt_bp_like(x):
+    if pd.isna(x):
+        return "N/A"
+    return f"{x:+.2f}"
 
-DEFAULT_WEIGHTS = {
-    "QQQ": 0.25,
-    "TLT": 0.20,
-    "TIP": 0.20,
-    "GLD": 0.20,
-    "DBC": 0.15,
-}
+def color_signal(val: str):
+    if not isinstance(val, str):
+        return ""
+    low = val.lower()
+    if any(k in low for k in ["risk-on", "positive", "strong", "bull", "improving", "easing", "healthy"]):
+        return "background-color: rgba(0, 180, 0, 0.15); color: #116611;"
+    if any(k in low for k in ["risk-off", "negative", "weak", "bear", "stress", "tightening", "deteriorating"]):
+        return "background-color: rgba(220, 0, 0, 0.15); color: #991111;"
+    return "background-color: rgba(180, 180, 0, 0.12); color: #7a5f00;"
 
-RANGE_OPTIONS = {
-    "6M": 180,
-    "1Y": 365,
-    "3Y": 365 * 3,
-    "5Y": 365 * 5,
-    "10Y": 365 * 10,
-}
+def add_change_columns(series: pd.Series):
+    """
+    Returns latest level and changes for 1D / 1W / 1M / 1Y.
+    For daily market prices: percentage change.
+    For yields/macro levels: absolute change.
+    """
+    s = series.dropna().copy()
+    if s.empty or len(s) < 3:
+        return {
+            "latest": np.nan,
+            "1D": np.nan,
+            "1W": np.nan,
+            "1M": np.nan,
+            "1Y": np.nan
+        }
 
-# --------------------------------------------------
-# Helper Functions
-# --------------------------------------------------
-def safe_pct_change(series: pd.Series, periods: int = 1) -> pd.Series:
-    return series.pct_change(periods=periods) * 100
+    latest = s.iloc[-1]
 
+    def safe_shift(periods):
+        if len(s) <= periods:
+            return np.nan
+        return s.iloc[-(periods + 1)]
 
-def latest_valid(series: pd.Series):
-    s = series.dropna()
-    return s.iloc[-1] if len(s) else np.nan
-
-
-def classify_score(score: int) -> str:
-    if score >= 3:
-        return "Risk-On"
-    elif score >= 0:
-        return "Balanced"
-    elif score >= -3:
-        return "Defensive"
-    return "Risk-Off"
-
-
-def normalize_weights(weights: dict) -> dict:
-    total = sum(weights.values())
-    if total == 0:
-        return weights
-    return {k: v / total for k, v in weights.items()}
-
-
-def portfolio_bias_from_score(score: int, inflation_signal: int) -> dict:
-    w = DEFAULT_WEIGHTS.copy()
-
-    if score >= 3:
-        w["QQQ"] = 0.40
-        w["TLT"] = 0.15
-        w["TIP"] = 0.15
-        w["GLD"] = 0.15
-        w["DBC"] = 0.15
-    elif score >= 0:
-        w["QQQ"] = 0.28
-        w["TLT"] = 0.18
-        w["TIP"] = 0.20
-        w["GLD"] = 0.19
-        w["DBC"] = 0.15
-    elif score >= -3:
-        w["QQQ"] = 0.18
-        w["TLT"] = 0.22
-        w["TIP"] = 0.24
-        w["GLD"] = 0.22
-        w["DBC"] = 0.14
-    else:
-        w["QQQ"] = 0.10
-        w["TLT"] = 0.28
-        w["TIP"] = 0.24
-        w["GLD"] = 0.24
-        w["DBC"] = 0.14
-
-    if inflation_signal < 0:
-        w["TIP"] += 0.03
-        w["GLD"] += 0.02
-        w["QQQ"] -= 0.03
-        w["TLT"] -= 0.02
-
-    return normalize_weights(w)
-
-# --------------------------------------------------
-# FRED API Loader
-# --------------------------------------------------
-@st.cache_data(ttl=60 * 60)
-def load_fred_series_api(series_id: str, api_key: str, observation_start: str = "2000-01-01") -> pd.Series:
-    params = {
-        "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
-        "observation_start": observation_start,
-        "sort_order": "asc",
+    return {
+        "latest": latest,
+        "1D_base": safe_shift(1),
+        "1W_base": safe_shift(5),
+        "1M_base": safe_shift(21),
+        "1Y_base": safe_shift(252),
     }
 
-    r = requests.get(FRED_BASE_URL, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+def calc_pct_change(latest, base):
+    if pd.isna(latest) or pd.isna(base) or base == 0:
+        return np.nan
+    return (latest / base - 1.0) * 100.0
 
-    if "observations" not in data:
-        raise RuntimeError(f"Invalid FRED response for {series_id}: {data}")
+def calc_abs_change(latest, base):
+    if pd.isna(latest) or pd.isna(base):
+        return np.nan
+    return latest - base
 
-    df = pd.DataFrame(data["observations"])
-    if df.empty:
-        return pd.Series(dtype=float, name=series_id)
+def infer_signal(row):
+    name = row["Asset"]
+    group = row["Group"]
+    c1m = row["1M_num"]
+    c1y = row["1Y_num"]
+    latest = row["Latest_num"]
 
-    df["date"] = pd.to_datetime(df["date"])
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    s = df.set_index("date")["value"].sort_index()
-    s.name = series_id
-    return s
+    if group == "Equity":
+        if pd.notna(c1m) and pd.notna(c1y):
+            if c1m > 0 and c1y > 0:
+                return "Risk-On"
+            if c1m < 0 and c1y < 0:
+                return "Risk-Off"
+        return "Neutral"
 
+    if group == "Risk Asset":
+        if pd.notna(c1m) and c1m > 0:
+            return "Risk-On"
+        if pd.notna(c1m) and c1m < 0:
+            return "Risk-Off"
+        return "Neutral"
 
-@st.cache_data(ttl=60 * 60)
-def load_all_fred_api(api_key: str, observation_start: str = "2000-01-01") -> pd.DataFrame:
-    frames = []
-    errors = []
+    if group == "FX / Dollar":
+        if pd.notna(c1m) and c1m > 0:
+            return "USD Strong"
+        if pd.notna(c1m) and c1m < 0:
+            return "USD Weak"
+        return "Neutral"
 
-    for sid in FRED_SERIES.keys():
-        try:
-            s = load_fred_series_api(sid, api_key=api_key, observation_start=observation_start)
-            frames.append(s.rename(sid))
-        except Exception as e:
-            errors.append((sid, str(e)))
-
-    if errors:
-        st.warning("Some FRED series failed to load:")
-        for sid, msg in errors:
-            st.write(f"- {sid}: {msg}")
-
-    if not frames:
-        raise RuntimeError("No FRED series loaded. Check your API key and internet connection.")
-
-    return pd.concat(frames, axis=1).sort_index()
-
-# --------------------------------------------------
-# GDPNow Scraper
-# --------------------------------------------------
-@st.cache_data(ttl=60 * 60)
-def fetch_gdpnow():
-    url = "https://www.atlantafed.org/research-and-data/data/gdpnow"
-    try:
-        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
-        text = soup.get_text(" ", strip=True)
-
-        m_value = re.search(r"([+-]?\d+(?:\.\d+)?)\s*%\s*Latest GDPNow Estimate", text, re.I)
-        m_date = re.search(r"Updated:\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})", text, re.I)
-        m_quarter = re.search(r"Latest GDPNow Estimate for\s*([0-9]{4}:Q[1-4])", text, re.I)
-
-        return {
-            "value": float(m_value.group(1)) if m_value else np.nan,
-            "updated": pd.to_datetime(m_date.group(1)) if m_date else pd.NaT,
-            "quarter": m_quarter.group(1) if m_quarter else "",
-        }
-    except Exception:
-        return {
-            "value": np.nan,
-            "updated": pd.NaT,
-            "quarter": "",
-        }
-
-# --------------------------------------------------
-# Market Data Loader
-# --------------------------------------------------
-@st.cache_data(ttl=60 * 60)
-def load_market_data(tickers: list[str], period: str = "10y") -> pd.DataFrame:
-    data = yf.download(tickers, period=period, auto_adjust=True, progress=False)
-
-    if isinstance(data.columns, pd.MultiIndex):
-        if "Close" in data.columns.get_level_values(0):
-            close = data["Close"].copy()
+    if group in ["Rates", "Real Yield"]:
+        if "Spread" in name:
+            if pd.notna(latest):
+                if latest < 0:
+                    return "Curve Inverted"
+                if latest > 0.5:
+                    return "Curve Normal"
+            return "Neutral"
         else:
-            close = data.xs("Close", axis=1, level=0)
-    else:
-        close = data.copy()
+            if pd.notna(c1m):
+                if c1m > 0:
+                    return "Tightening"
+                if c1m < 0:
+                    return "Easing"
+            return "Neutral"
 
-    return close.dropna(how="all")
+    if group in ["Inflation", "Inflation / Commodity"]:
+        if pd.notna(c1m):
+            if c1m > 0:
+                return "Inflation Rising"
+            if c1m < 0:
+                return "Inflation Cooling"
+        return "Neutral"
 
-# --------------------------------------------------
-# Feature Engineering
-# --------------------------------------------------
-def prepare_macro_features(fred: pd.DataFrame) -> pd.DataFrame:
-    df = fred.copy()
+    if group == "Liquidity":
+        if pd.notna(c1y):
+            if c1y > 0:
+                return "Liquidity Positive"
+            if c1y < 0:
+                return "Liquidity Negative"
+        return "Neutral"
 
-    df["YC_10Y_2Y"] = df["DGS10"] - df["DGS2"]
+    if group == "Labor":
+        if pd.notna(c1y):
+            if c1y < 0:
+                return "Labor Healthy"
+            if c1y > 0:
+                return "Labor Weakening"
+        return "Neutral"
 
-    df["WALCL_13W_PCT"] = safe_pct_change(df["WALCL"], periods=13)
-    df["PAYEMS_6M_PCT"] = safe_pct_change(df["PAYEMS"], periods=6)
+    if group == "Consumption":
+        if pd.notna(c1y):
+            if c1y > 0:
+                return "Demand Positive"
+            if c1y < 0:
+                return "Demand Weakening"
+        return "Neutral"
 
-    df["CPI_YOY"] = safe_pct_change(df["CPIAUCSL"], periods=12)
-    df["CPI_3M_ANN"] = ((df["CPIAUCSL"] / df["CPIAUCSL"].shift(3)) ** 4 - 1) * 100
+    return "Neutral"
 
-    df["UNRATE_6M_DELTA"] = df["UNRATE"] - df["UNRATE"].shift(6)
-
-    df["NFCI_13W_DELTA"] = df["NFCI"] - df["NFCI"].shift(13)
-    df["HY_OAS_13W_DELTA"] = df["BAMLH0A0HYM2"] - df["BAMLH0A0HYM2"].shift(13)
-    df["DFII10_13W_DELTA"] = df["DFII10"] - df["DFII10"].shift(13)
-    df["T10YIE_13W_DELTA"] = df["T10YIE"] - df["T10YIE"].shift(13)
-    df["FEDFUNDS_26W_DELTA"] = df["FEDFUNDS"] - df["FEDFUNDS"].shift(26)
-
-    return df
-
-# --------------------------------------------------
-# Signal Engine
-# --------------------------------------------------
-def compute_category_scores(df: pd.DataFrame, gdpnow_value: float | None = None) -> dict:
-    latest = df.ffill().iloc[-1]
-
-    liq = 0
-    if pd.notna(latest["WALCL_13W_PCT"]):
-        liq += 1 if latest["WALCL_13W_PCT"] > 1.0 else -1
-    if pd.notna(latest["NFCI"]):
-        liq += 1 if latest["NFCI"] < 0 else -1
-    liquidity_score = 1 if liq >= 1 else (-1 if liq <= -1 else 0)
-
-    growth = 0
-    if pd.notna(latest["UNRATE_6M_DELTA"]):
-        growth += 1 if latest["UNRATE_6M_DELTA"] <= 0.0 else -1
-    if pd.notna(latest["PAYEMS_6M_PCT"]):
-        growth += 1 if latest["PAYEMS_6M_PCT"] > 0.5 else -1
-    if gdpnow_value is not None and not np.isnan(gdpnow_value):
-        growth += 1 if gdpnow_value > 1.5 else (-1 if gdpnow_value < 0.5 else 0)
-    growth_score = 1 if growth >= 1 else (-1 if growth <= -1 else 0)
-
-    inflation = 0
-    if pd.notna(latest["CPI_YOY"]):
-        inflation += 1 if latest["CPI_YOY"] < 3.0 else -1
-    if pd.notna(latest["CPI_3M_ANN"]):
-        inflation += 1 if latest["CPI_3M_ANN"] < 3.0 else -1
-    if pd.notna(latest["T10YIE_13W_DELTA"]):
-        inflation += 1 if latest["T10YIE_13W_DELTA"] <= 0 else -1
-    inflation_score = 1 if inflation >= 1 else (-1 if inflation <= -1 else 0)
-
-    rates = 0
-    if pd.notna(latest["YC_10Y_2Y"]):
-        rates += 1 if latest["YC_10Y_2Y"] > 0 else -1
-    if pd.notna(latest["DFII10_13W_DELTA"]):
-        rates += 1 if latest["DFII10_13W_DELTA"] <= 0 else -1
-    if pd.notna(latest["FEDFUNDS_26W_DELTA"]):
-        rates += 1 if latest["FEDFUNDS_26W_DELTA"] <= 0 else -1
-    rates_score = 1 if rates >= 1 else (-1 if rates <= -1 else 0)
-
-    stress = 0
-    if pd.notna(latest["NFCI"]):
-        stress += 1 if latest["NFCI"] < 0 else -1
-    if pd.notna(latest["HY_OAS_13W_DELTA"]):
-        stress += 1 if latest["HY_OAS_13W_DELTA"] <= 0 else -1
-    stress_score = 1 if stress >= 1 else (-1 if stress <= -1 else 0)
-
-    scores = {
-        "Liquidity": liquidity_score,
-        "Growth": growth_score,
-        "Inflation": inflation_score,
-        "Rates": rates_score,
-        "Stress": stress_score,
-    }
-    scores["Total"] = int(sum(scores.values()))
-    return scores
-
-
-def scores_to_df(scores: dict) -> pd.DataFrame:
+def build_group_summary(df):
     rows = []
-    for k, v in scores.items():
-        if k == "Total":
+    for grp in GROUP_ORDER:
+        g = df[df["Group"] == grp].copy()
+        if g.empty:
             continue
+
+        signals = g["Signal"].dropna().tolist()
+        positive_cnt = sum(any(k in s.lower() for k in [
+            "risk-on", "positive", "strong", "normal", "healthy", "easing", "cooling"
+        ]) for s in signals)
+        negative_cnt = sum(any(k in s.lower() for k in [
+            "risk-off", "negative", "weak", "inverted", "tightening", "rising", "weakening"
+        ]) for s in signals)
+
+        if positive_cnt > negative_cnt:
+            summary = "Positive"
+        elif negative_cnt > positive_cnt:
+            summary = "Negative"
+        else:
+            summary = "Neutral"
+
         rows.append({
-            "Category": k,
-            "Score": v,
-            "Status": "Bullish" if v > 0 else ("Defensive" if v < 0 else "Neutral")
+            "Group": grp,
+            "Assets": len(g),
+            "1D Avg": g["1D_num"].mean(skipna=True),
+            "1W Avg": g["1W_num"].mean(skipna=True),
+            "1M Avg": g["1M_num"].mean(skipna=True),
+            "1Y Avg": g["1Y_num"].mean(skipna=True),
+            "Group Signal": summary
         })
     return pd.DataFrame(rows)
 
+# =========================================================
+# Data loaders
+# =========================================================
+@st.cache_data(ttl=60 * 30)
+def get_yf_history(symbols, period="2y"):
+    if not symbols:
+        return pd.DataFrame()
 
-def build_history_scores(df: pd.DataFrame) -> pd.DataFrame:
-    monthly = df.ffill().resample("M").last().copy()
-    rows = []
+    df = yf.download(
+        tickers=symbols,
+        period=period,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        group_by="ticker",
+        threads=True
+    )
 
-    for idx in monthly.index:
-        sub = monthly.loc[:idx].copy()
-        if len(sub) < 14:
+    if df.empty:
+        return pd.DataFrame()
+
+    closes = {}
+
+    # Single ticker case
+    if isinstance(df.columns, pd.Index):
+        closes[symbols[0]] = df["Close"]
+        result = pd.DataFrame(closes)
+        result.index = pd.to_datetime(result.index)
+        return result.sort_index()
+
+    # Multi-ticker case
+    for sym in symbols:
+        try:
+            closes[sym] = df[sym]["Close"]
+        except Exception:
             continue
 
-        latest = sub.iloc[-1]
-        scores = {}
+    result = pd.DataFrame(closes)
+    result.index = pd.to_datetime(result.index)
+    return result.sort_index()
 
-        liq_raw = 0
-        liq_raw += 1 if latest["WALCL_13W_PCT"] > 1.0 else -1
-        liq_raw += 1 if latest["NFCI"] < 0 else -1
-        scores["Liquidity"] = 1 if liq_raw >= 1 else (-1 if liq_raw <= -1 else 0)
+@st.cache_data(ttl=60 * 60)
+def get_fred_series(series_id, observation_start="2020-01-01"):
+    if not FRED_API_KEY:
+        raise ValueError("FRED_API_KEY is missing. Please set it as an environment variable.")
 
-        growth_raw = 0
-        growth_raw += 1 if latest["UNRATE_6M_DELTA"] <= 0 else -1
-        growth_raw += 1 if latest["PAYEMS_6M_PCT"] > 0.5 else -1
-        scores["Growth"] = 1 if growth_raw >= 1 else (-1 if growth_raw <= -1 else 0)
+    params = {
+        "series_id": series_id,
+        "api_key": FRED_API_KEY,
+        "file_type": "json",
+        "observation_start": observation_start,
+    }
+    resp = requests.get(FRED_BASE_URL, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
 
-        infl_raw = 0
-        infl_raw += 1 if latest["CPI_YOY"] < 3.0 else -1
-        infl_raw += 1 if latest["CPI_3M_ANN"] < 3.0 else -1
-        infl_raw += 1 if latest["T10YIE_13W_DELTA"] <= 0 else -1
-        scores["Inflation"] = 1 if infl_raw >= 1 else (-1 if infl_raw <= -1 else 0)
+    observations = data.get("observations", [])
+    rows = []
+    for item in observations:
+        value = item.get("value")
+        if value in (None, ".", ""):
+            val = np.nan
+        else:
+            try:
+                val = float(value)
+            except Exception:
+                val = np.nan
+        rows.append((pd.to_datetime(item["date"]), val))
 
-        rates_raw = 0
-        rates_raw += 1 if latest["YC_10Y_2Y"] > 0 else -1
-        rates_raw += 1 if latest["DFII10_13W_DELTA"] <= 0 else -1
-        rates_raw += 1 if latest["FEDFUNDS_26W_DELTA"] <= 0 else -1
-        scores["Rates"] = 1 if rates_raw >= 1 else (-1 if rates_raw <= -1 else 0)
+    s = pd.Series(
+        data=[v for _, v in rows],
+        index=[d for d, _ in rows],
+        name=series_id
+    ).sort_index()
 
-        stress_raw = 0
-        stress_raw += 1 if latest["NFCI"] < 0 else -1
-        stress_raw += 1 if latest["HY_OAS_13W_DELTA"] <= 0 else -1
-        scores["Stress"] = 1 if stress_raw >= 1 else (-1 if stress_raw <= -1 else 0)
+    return s
 
-        total = sum(scores.values())
-        rows.append({
-            "Date": idx,
-            **scores,
-            "Total": total,
-            "Regime": classify_score(total),
-        })
+@st.cache_data(ttl=60 * 60)
+def load_all_fred(series_meta):
+    out = {}
+    for item in series_meta:
+        sid = item["symbol"]
+        try:
+            out[sid] = get_fred_series(sid, observation_start="2020-01-01")
+        except Exception:
+            out[sid] = pd.Series(dtype=float, name=sid)
+    return out
 
-    return pd.DataFrame(rows).set_index("Date")
+# =========================================================
+# Transform
+# =========================================================
+def build_market_table(yf_hist, fred_hist, selected_groups):
+    rows = []
 
-# --------------------------------------------------
-# Plot Functions
-# --------------------------------------------------
-def make_line_chart(df: pd.DataFrame, title: str, yaxis_title: str = ""):
-    fig = go.Figure()
+    # Market assets
+    for item in MARKET_ASSETS:
+        if selected_groups and item["group"] not in selected_groups:
+            continue
 
-    for col in df.columns:
-        s = df[col].dropna()
+        sym = item["symbol"]
+        if sym not in yf_hist.columns:
+            continue
+
+        s = yf_hist[sym].dropna()
+        stat = add_change_columns(s)
+
+        latest = stat["latest"]
+        row = {
+            "Group": item["group"],
+            "Asset": item["name"],
+            "Ticker": sym,
+            "Latest_num": latest,
+            "1D_num": calc_pct_change(latest, stat["1D_base"]),
+            "1W_num": calc_pct_change(latest, stat["1W_base"]),
+            "1M_num": calc_pct_change(latest, stat["1M_base"]),
+            "1Y_num": calc_pct_change(latest, stat["1Y_base"]),
+            "Unit": "pct"
+        }
+        rows.append(row)
+
+    # FRED assets
+    fred_meta_map = {x["symbol"]: x for x in FRED_SERIES}
+
+    for sid, s in fred_hist.items():
+        meta = fred_meta_map[sid]
+        if selected_groups and meta["group"] not in selected_groups:
+            continue
+
+        s = s.dropna()
         if s.empty:
             continue
 
-        fig.add_trace(
-            go.Scatter(
-                x=s.index,
-                y=s.values,
-                mode="lines+markers",
-                name=col,
-                line=dict(width=2),
-                marker=dict(size=4),
-                connectgaps=False
-            )
+        # Convert lower-frequency macro series to daily forward-filled
+        daily = s.resample("D").ffill()
+
+        stat = add_change_columns(daily)
+        latest = stat["latest"]
+
+        row = {
+            "Group": meta["group"],
+            "Asset": meta["name"],
+            "Ticker": sid,
+            "Latest_num": latest,
+            "1D_num": calc_abs_change(latest, stat["1D_base"]),
+            "1W_num": calc_abs_change(latest, stat["1W_base"]),
+            "1M_num": calc_abs_change(latest, stat["1M_base"]),
+            "1Y_num": calc_abs_change(latest, stat["1Y_base"]),
+            "Unit": "abs"
+        }
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df["Signal"] = df.apply(infer_signal, axis=1)
+
+    # Display formatting
+    def fmt_latest(row):
+        if row["Unit"] == "pct":
+            return fmt_abs(row["Latest_num"])
+        return fmt_abs(row["Latest_num"])
+
+    def fmt_change(row, col):
+        if row["Unit"] == "pct":
+            return fmt_pct(row[col])
+        return fmt_bp_like(row[col])
+
+    df["Latest"] = df.apply(fmt_latest, axis=1)
+    df["1D"] = df.apply(lambda r: fmt_change(r, "1D_num"), axis=1)
+    df["1W"] = df.apply(lambda r: fmt_change(r, "1W_num"), axis=1)
+    df["1M"] = df.apply(lambda r: fmt_change(r, "1M_num"), axis=1)
+    df["1Y"] = df.apply(lambda r: fmt_change(r, "1Y_num"), axis=1)
+
+    display_cols = ["Group", "Asset", "Ticker", "Latest", "1D", "1W", "1M", "1Y", "Signal"]
+    df = df[display_cols + ["Latest_num", "1D_num", "1W_num", "1M_num", "1Y_num"]]
+
+    return df
+
+def style_market_table(df):
+    display_df = df[["Group", "Asset", "Ticker", "Latest", "1D", "1W", "1M", "1Y", "Signal"]].copy()
+    return (
+        display_df.style
+        .map(color_signal, subset=["Signal"])
+    )
+
+# =========================================================
+# UI
+# =========================================================
+st.title("📊 Noise vs Signal Dashboard")
+st.caption("Long-term investing dashboard focused on signal, not daily noise.")
+
+with st.sidebar:
+    st.header("Settings")
+
+    if not FRED_API_KEY:
+        st.error("FRED_API_KEY is not set.")
+    else:
+        st.success("FRED API key loaded.")
+
+    selected_groups = st.multiselect(
+        "Select groups",
+        options=GROUP_ORDER,
+        default=["Equity", "Rates", "Inflation / Commodity", "Liquidity", "FX / Dollar", "Risk Asset"]
+    )
+
+    chart_options = [x["symbol"] for x in MARKET_ASSETS] + [x["symbol"] for x in FRED_SERIES]
+    default_chart = ["SPY", "QQQ", "DGS10", "T10Y2Y", "DFII10", "WALCL"]
+    selected_chart_symbols = st.multiselect(
+        "Chart series",
+        options=chart_options,
+        default=default_chart
+    )
+
+    chart_lookback = st.selectbox(
+        "Chart lookback",
+        options=["6M", "1Y", "2Y"],
+        index=1
+    )
+
+# =========================================================
+# Load data
+# =========================================================
+yf_symbols = [x["symbol"] for x in MARKET_ASSETS]
+fred_data = {}
+yf_hist = pd.DataFrame()
+
+try:
+    yf_hist = get_yf_history(yf_symbols, period="2y")
+except Exception as e:
+    st.error(f"Failed to load Yahoo Finance data: {e}")
+
+try:
+    fred_data = load_all_fred(FRED_SERIES)
+except Exception as e:
+    st.error(f"Failed to load FRED data: {e}")
+    fred_data = {}
+
+market_df = build_market_table(yf_hist, fred_data, selected_groups)
+
+# =========================================================
+# Tabs
+# =========================================================
+tab1, tab2, tab3 = st.tabs([
+    "1) Market Snapshot",
+    "2) Signal Charts",
+    "3) Raw Data / Notes"
+])
+
+# =========================================================
+# TAB 1
+# =========================================================
+with tab1:
+    st.subheader("Global Snapshot — 1D / 1W / 1M / 1Y Change")
+
+    if market_df.empty:
+        st.warning("No data available.")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+
+        eq_count = int((market_df["Group"] == "Equity").sum())
+        rates_count = int((market_df["Group"] == "Rates").sum())
+        infl_count = int((market_df["Group"].isin(["Inflation", "Inflation / Commodity"])).sum())
+        liq_count = int((market_df["Group"] == "Liquidity").sum())
+
+        c1.metric("Equity Series", eq_count)
+        c2.metric("Rates Series", rates_count)
+        c3.metric("Inflation Series", infl_count)
+        c4.metric("Liquidity Series", liq_count)
+
+        st.dataframe(
+            style_market_table(market_df),
+            use_container_width=True,
+            hide_index=True
         )
 
-    fig.update_layout(
-        title=title,
-        height=420,
-        template="plotly_white",
-        margin=dict(l=20, r=20, t=50, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        yaxis_title=yaxis_title,
-    )
-    return fig
+        st.markdown("---")
+        st.subheader("Group Summary")
 
+        group_summary = build_group_summary(market_df)
 
-def make_bar_chart(df: pd.DataFrame, title: str):
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=df["Category"], y=df["Score"], text=df["Status"], textposition="outside"))
-    fig.update_layout(
-        title=title,
-        height=360,
-        template="plotly_white",
-        margin=dict(l=20, r=20, t=50, b=20),
-        yaxis=dict(range=[-1.5, 1.5], dtick=1),
-    )
-    return fig
+        if not group_summary.empty:
+            # format group summary
+            for col in ["1D Avg", "1W Avg", "1M Avg", "1Y Avg"]:
+                group_summary[col] = group_summary[col].map(lambda x: "N/A" if pd.isna(x) else f"{x:+.2f}")
 
+            st.dataframe(
+                group_summary.style.map(color_signal, subset=["Group Signal"]),
+                use_container_width=True,
+                hide_index=True
+            )
 
-def make_pie(weights: dict, title: str):
-    fig = go.Figure(data=[go.Pie(labels=list(weights.keys()), values=list(weights.values()), hole=0.4)])
-    fig.update_layout(
-        title=title,
-        height=420,
-        template="plotly_white",
-        margin=dict(l=20, r=20, t=50, b=20),
-    )
-    return fig
+        st.markdown("---")
+        st.subheader("Grouped Tables")
 
+        for grp in GROUP_ORDER:
+            sub = market_df[market_df["Group"] == grp].copy()
+            if sub.empty:
+                continue
 
-def make_regime_history_chart(hist: pd.DataFrame, price: pd.Series | None = None):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=hist.index, y=hist["Total"], mode="lines", name="Signal Score"))
+            st.markdown(f"### {grp}")
+            st.dataframe(
+                style_market_table(sub),
+                use_container_width=True,
+                hide_index=True
+            )
 
-    if price is not None and len(price.dropna()) > 0:
-        p = price.reindex(hist.index).ffill()
-        p = p / p.iloc[0] * 100
-        fig.add_trace(go.Scatter(
-            x=p.index, y=p, mode="lines", name="Benchmark (rebased=100)", yaxis="y2"
-        ))
-
-    fig.update_layout(
-        title="Historical Signal Score vs Benchmark",
-        height=460,
-        template="plotly_white",
-        margin=dict(l=20, r=20, t=50, b=20),
-        yaxis=dict(title="Signal Score"),
-        yaxis2=dict(title="Benchmark rebased", overlaying="y", side="right"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    )
-    return fig
-
-# --------------------------------------------------
-# Sidebar
-# --------------------------------------------------
-st.sidebar.title("FRED API Dashboard Settings")
-
-env_api_key = os.getenv("FRED_API_KEY", "")
-api_key_input = st.sidebar.text_input("FRED API Key", value=env_api_key, type="password")
-
-selected_range_label = st.sidebar.selectbox("Lookback Range", list(RANGE_OPTIONS.keys()), index=2)
-lookback_days = RANGE_OPTIONS[selected_range_label]
-
-observation_start = st.sidebar.text_input("Observation Start", value="2000-01-01")
-show_gdpnow = st.sidebar.checkbox("Use GDPNow in Growth Signal", value=True)
-show_market = st.sidebar.checkbox("Load ETF Market Data", value=True)
-history_benchmark = st.sidebar.selectbox("History Benchmark", ["QQQ", "SPY", "TLT", "TIP", "GLD"], index=0)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Use your own FRED API key.")
-
-if not api_key_input:
-    st.error("Please enter your FRED API key in the sidebar or set FRED_API_KEY.")
-    st.stop()
-
-# --------------------------------------------------
-# Load Data
-# --------------------------------------------------
-with st.spinner("Loading macro data from FRED API..."):
-    fred = load_all_fred_api(api_key=api_key_input, observation_start=observation_start)
-    macro = prepare_macro_features(fred)
-
-gdpnow = fetch_gdpnow() if show_gdpnow else {"value": np.nan, "updated": pd.NaT, "quarter": ""}
-market = None
-
-if show_market:
-    with st.spinner("Loading ETF market data..."):
-        market = load_market_data(list(ETF_TICKERS.keys()), period="10y")
-
-start_date = pd.Timestamp.today().normalize() - pd.Timedelta(days=lookback_days)
-macro_view = macro.loc[macro.index >= start_date].copy().sort_index()
-market_view = market.loc[market.index >= start_date].copy() if market is not None else None
-
-scores = compute_category_scores(macro, gdpnow_value=gdpnow["value"])
-score_df = scores_to_df(scores)
-regime = classify_score(scores["Total"])
-weights = portfolio_bias_from_score(scores["Total"], scores["Inflation"])
-history_scores = build_history_scores(macro)
-
-# --------------------------------------------------
-# Header
-# --------------------------------------------------
-st.title("Signal-Based Investment Dashboard")
-st.caption("FRED API version — designed to focus on structural signals, not daily noise.")
-
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Liquidity", "Bullish" if scores["Liquidity"] > 0 else ("Defensive" if scores["Liquidity"] < 0 else "Neutral"), scores["Liquidity"])
-c2.metric("Growth", "Bullish" if scores["Growth"] > 0 else ("Defensive" if scores["Growth"] < 0 else "Neutral"), scores["Growth"])
-c3.metric("Inflation", "Bullish" if scores["Inflation"] > 0 else ("Defensive" if scores["Inflation"] < 0 else "Neutral"), scores["Inflation"])
-c4.metric("Rates", "Bullish" if scores["Rates"] > 0 else ("Defensive" if scores["Rates"] < 0 else "Neutral"), scores["Rates"])
-c5.metric("Stress", "Bullish" if scores["Stress"] > 0 else ("Defensive" if scores["Stress"] < 0 else "Neutral"), scores["Stress"])
-c6.metric("Total Regime", regime, scores["Total"])
-
-if show_gdpnow:
-    g1, g2, g3 = st.columns([1, 1, 2])
-    g1.metric("GDPNow", f"{gdpnow['value']:.1f}%" if pd.notna(gdpnow["value"]) else "N/A")
-    g2.metric("Quarter", gdpnow["quarter"] if gdpnow["quarter"] else "N/A")
-    g3.write(f"Updated: {gdpnow['updated'].date() if pd.notna(gdpnow['updated']) else 'N/A'}")
-
-st.markdown("---")
-
-# --------------------------------------------------
-# Tabs
-# --------------------------------------------------
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["Overview", "Liquidity", "Growth", "Inflation", "Rates & Stress", "Allocation", "History"]
-)
-
-# Overview
-with tab1:
-    left, right = st.columns([1.2, 1])
-
-    with left:
-        st.subheader("Signal Scorecard")
-        st.dataframe(score_df, use_container_width=True, hide_index=True)
-        st.plotly_chart(make_bar_chart(score_df, "Category Scores"), use_container_width=True)
-
-    with right:
-        st.subheader("Suggested Portfolio Bias")
-        st.plotly_chart(make_pie(weights, f"{regime} Allocation Bias"), use_container_width=True)
-
-        action_text = {
-            "Risk-On": "Overweight growth assets. Keep defense exposure but lean into QQQ/equities.",
-            "Balanced": "Keep core diversification. Avoid large shifts.",
-            "Defensive": "Emphasize TIP, gold, and some duration. Stay selective on risk assets.",
-            "Risk-Off": "Prioritize capital preservation. Hold more duration, inflation defense, and lower growth exposure."
-        }
-        st.info(action_text[regime])
-
-        latest = macro.ffill().iloc[-1]
-        key_df = pd.DataFrame([
-            ["Fed Balance Sheet 13W %", latest["WALCL_13W_PCT"]],
-            ["NFCI", latest["NFCI"]],
-            ["Unemployment Rate", latest["UNRATE"]],
-            ["CPI YoY", latest["CPI_YOY"]],
-            ["10Y-2Y Curve", latest["YC_10Y_2Y"]],
-            ["10Y Breakeven", latest["T10YIE"]],
-            ["10Y Real Yield", latest["DFII10"]],
-            ["High Yield OAS", latest["BAMLH0A0HYM2"]],
-        ], columns=["Metric", "Value"])
-        key_df["Value"] = key_df["Value"].map(lambda x: round(float(x), 2) if pd.notna(x) else np.nan)
-        st.dataframe(key_df, use_container_width=True, hide_index=True)
-
-# Liquidity
+# =========================================================
+# TAB 2
+# =========================================================
 with tab2:
-    st.subheader("Liquidity Signal")
-    l1, l2 = st.columns(2)
+    st.subheader("Signal Charts")
 
-    walcl_df = macro_view[["WALCL"]].copy().ffill()
-    walcl_df["WALCL (Trillions)"] = walcl_df["WALCL"] / 1000
-    walcl_df = walcl_df[["WALCL (Trillions)"]].dropna()
+    if not selected_chart_symbols:
+        st.info("Please select at least one chart series in the sidebar.")
+    else:
+        lookback_days = {"6M": 180, "1Y": 365, "2Y": 730}[chart_lookback]
+        min_date = pd.Timestamp.today().normalize() - pd.Timedelta(days=lookback_days)
 
-    nfci_df = macro_view[["NFCI", "ANFCI"]].copy().ffill().dropna(how="all")
+        combined = []
 
-    with l1:
-        st.plotly_chart(make_line_chart(walcl_df, "Fed Balance Sheet (WALCL)", "USD Trillions"), use_container_width=True)
-    with l2:
-        st.plotly_chart(make_line_chart(nfci_df, "Financial Conditions (NFCI / ANFCI)", "Index"), use_container_width=True)
+        # Yahoo series
+        for sym in selected_chart_symbols:
+            if sym in yf_hist.columns:
+                s = yf_hist[sym].dropna()
+                s = s[s.index >= min_date]
+                if not s.empty:
+                    base = s.iloc[0]
+                    norm = (s / base) * 100.0
+                    temp = pd.DataFrame({
+                        "Date": norm.index,
+                        "Value": norm.values,
+                        "Series": sym
+                    })
+                    combined.append(temp)
 
-# Growth
+        # FRED series
+        fred_map = {x["symbol"]: x for x in FRED_SERIES}
+        for sym in selected_chart_symbols:
+            if sym in fred_data:
+                s = fred_data[sym].dropna()
+                if s.empty:
+                    continue
+                s = s.resample("D").ffill()
+                s = s[s.index >= min_date]
+                if not s.empty:
+                    # Normalize most series for comparison
+                    if fred_map[sym]["group"] in ["Liquidity", "Consumption", "Labor"]:
+                        base = s.iloc[0]
+                        if base != 0 and pd.notna(base):
+                            plot_s = (s / base) * 100.0
+                        else:
+                            plot_s = s.copy()
+                    else:
+                        plot_s = s.copy()
+
+                    temp = pd.DataFrame({
+                        "Date": plot_s.index,
+                        "Value": plot_s.values,
+                        "Series": sym
+                    })
+                    combined.append(temp)
+
+        if combined:
+            plot_df = pd.concat(combined, ignore_index=True)
+            fig = px.line(
+                plot_df,
+                x="Date",
+                y="Value",
+                color="Series",
+                title="Selected Market / Macro Series"
+            )
+            fig.update_layout(height=650, legend_title_text="")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("No chartable data available for the current selection.")
+
+# =========================================================
+# TAB 3
+# =========================================================
 with tab3:
-    st.subheader("Growth Signal")
-    gcol1, gcol2 = st.columns(2)
+    st.subheader("Raw Data / Notes")
 
-    growth_chart_df = macro_view[["UNRATE"]].copy().ffill().dropna()
+    st.markdown("### What this dashboard does")
+    st.markdown(
+        """
+- The first tab starts with the **simplest possible market snapshot table**.
+- It shows **1D / 1W / 1M / 1Y changes** together.
+- It also organizes the same information by **group** so you can separate **noise** from **signal**.
+- Market prices use **percentage change**.
+- FRED macro / rate series use **absolute change**.
+        """
+    )
 
-    payroll_chart_df = macro_view[["PAYEMS"]].copy().ffill()
-    payroll_chart_df["Payrolls (M)"] = payroll_chart_df["PAYEMS"] / 1000
-    payroll_chart_df = payroll_chart_df[["Payrolls (M)"]].dropna()
+    st.markdown("### Series map")
+    series_map = pd.DataFrame(MARKET_ASSETS + FRED_SERIES)
+    st.dataframe(series_map, use_container_width=True, hide_index=True)
 
-    with gcol1:
-        st.plotly_chart(make_line_chart(growth_chart_df, "Unemployment Rate", "%"), use_container_width=True)
-    with gcol2:
-        st.plotly_chart(make_line_chart(payroll_chart_df, "Nonfarm Payrolls", "Millions"), use_container_width=True)
+    st.markdown("### Latest processed dataset")
+    if not market_df.empty:
+        st.dataframe(market_df, use_container_width=True, hide_index=True)
 
-# Inflation
-with tab4:
-    st.subheader("Inflation Signal")
-    i1, i2 = st.columns(2)
-
-    inflation_df = macro_view[["CPI_YOY", "CPI_3M_ANN"]].copy().ffill().dropna(how="all")
-    breakeven_df = macro_view[["T10YIE"]].copy().ffill().dropna()
-
-    with i1:
-        st.plotly_chart(make_line_chart(inflation_df, "Inflation Trend", "%"), use_container_width=True)
-    with i2:
-        st.plotly_chart(make_line_chart(breakeven_df, "10Y Breakeven Inflation", "%"), use_container_width=True)
-
-# Rates & Stress
-with tab5:
-    st.subheader("Rates, Curve, and Financial Stress")
-    r1, r2 = st.columns(2)
-
-    curve_df = macro_view[["DGS10", "DGS2", "YC_10Y_2Y"]].copy().ffill().dropna(how="all")
-    stress_df = macro_view[["BAMLH0A0HYM2", "DFII10", "FEDFUNDS"]].copy().ffill().dropna(how="all")
-
-    with r1:
-        st.plotly_chart(make_line_chart(curve_df, "Rates and Yield Curve", "%"), use_container_width=True)
-    with r2:
-        st.plotly_chart(make_line_chart(stress_df, "Credit / Real Yield / Policy Rate", "%"), use_container_width=True)
-
-# Allocation
-with tab6:
-    st.subheader("Signal-to-Allocation Map")
-
-    alloc_df = pd.DataFrame({
-        "Ticker": list(weights.keys()),
-        "Asset": [ETF_TICKERS.get(k, k) for k in weights.keys()],
-        "Suggested Weight (%)": [round(v * 100, 1) for v in weights.values()],
-    })
-    st.dataframe(alloc_df, use_container_width=True, hide_index=True)
-
-    if market_view is not None:
-        rows = []
-        for t in list(weights.keys()):
-            if t not in market_view.columns:
-                continue
-            s = market_view[t].dropna()
-            if len(s) < 60:
-                continue
-            ma50 = s.rolling(50).mean().iloc[-1]
-            ma200 = s.rolling(200).mean().iloc[-1] if len(s) >= 200 else np.nan
-
-            rows.append({
-                "Ticker": t,
-                "Price": round(float(s.iloc[-1]), 2),
-                "1M %": round(float(s.pct_change(21).iloc[-1] * 100), 2) if len(s) >= 21 else np.nan,
-                "3M %": round(float(s.pct_change(63).iloc[-1] * 100), 2) if len(s) >= 63 else np.nan,
-                "Above 50D MA": bool(s.iloc[-1] > ma50) if pd.notna(ma50) else None,
-                "Above 200D MA": bool(s.iloc[-1] > ma200) if pd.notna(ma200) else None,
-            })
-
-        trend_df = pd.DataFrame(rows)
-        st.subheader("ETF Trend Snapshot")
-        st.dataframe(trend_df, use_container_width=True, hide_index=True)
-
-# History
-with tab7:
-    st.subheader("Historical Regime")
-    h1, h2 = st.columns([2, 1])
-
-    with h1:
-        bench_series = None
-        if market is not None and history_benchmark in market.columns:
-            bench_series = market[history_benchmark]
-        st.plotly_chart(make_regime_history_chart(history_scores, bench_series), use_container_width=True)
-
-    with h2:
-        regime_counts = history_scores["Regime"].value_counts().rename_axis("Regime").reset_index(name="Months")
-        st.dataframe(regime_counts, use_container_width=True, hide_index=True)
-
-        recent_hist = history_scores.tail(12).reset_index()
-        recent_hist["Date"] = recent_hist["Date"].dt.strftime("%Y-%m")
-        st.dataframe(recent_hist, use_container_width=True, hide_index=True)
-
-# Footer
-st.markdown("---")
-st.markdown("""
-### Notes
-- This fixed version handles mixed-frequency FRED series better for charting.
-- Liquidity and Growth plots should now display correctly.
-- Review the dashboard weekly, not daily.
-- Use monthly allocation changes to reduce noise-driven decisions.
-""")
+    st.markdown("### Interpretation guide")
+    guide = pd.DataFrame([
+        {"Signal": "Risk-On", "Meaning": "Equities / risk assets trending positively"},
+        {"Signal": "Risk-Off", "Meaning": "Equities / risk assets weakening"},
+        {"Signal": "Tightening", "Meaning": "Rates or real yields moving higher"},
+        {"Signal": "Easing", "Meaning": "Rates moving lower"},
+        {"Signal": "Curve Inverted", "Meaning": "Yield curve below zero"},
+        {"Signal": "Liquidity Positive", "Meaning": "M2 / Fed balance sheet expanding"},
+        {"Signal": "Inflation Rising", "Meaning": "Commodity / breakeven inflation rising"},
+        {"Signal": "Labor Weakening", "Meaning": "Unemployment trend worsening"},
+    ])
+    st.dataframe(guide, use_container_width=True, hide_index=True)
