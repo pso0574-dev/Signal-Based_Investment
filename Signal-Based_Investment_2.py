@@ -62,6 +62,17 @@ GROUP_ORDER = [
     "Consumption",
 ]
 
+LOOKBACK_OPTIONS = ["1M", "3M", "6M", "1Y", "5Y", "10Y", "20Y"]
+LOOKBACK_MAP = {
+    "1M": 30,
+    "3M": 90,
+    "6M": 180,
+    "1Y": 365,
+    "5Y": 365 * 5,
+    "10Y": 365 * 10,
+    "20Y": 365 * 20,
+}
+
 # =========================================================
 # Formatting helpers
 # =========================================================
@@ -145,7 +156,7 @@ def extract_close_series(downloaded_df: pd.DataFrame, symbol: str) -> pd.Series:
     return pd.Series(dtype=float, name=symbol)
 
 @st.cache_data(ttl=60 * 30)
-def get_yf_history(symbols, period="2y"):
+def get_yf_history(symbols, period="max"):
     if not symbols:
         return pd.DataFrame()
 
@@ -185,7 +196,7 @@ def get_yf_history(symbols, period="2y"):
 # FRED helpers
 # =========================================================
 @st.cache_data(ttl=60 * 60)
-def get_fred_series(series_id, observation_start="2020-01-01"):
+def get_fred_series(series_id, observation_start="1990-01-01"):
     if not FRED_API_KEY:
         raise ValueError("FRED_API_KEY is missing. Please set it as an environment variable.")
 
@@ -225,7 +236,7 @@ def load_all_fred(series_meta):
     for item in series_meta:
         sid = item["symbol"]
         try:
-            out[sid] = get_fred_series(sid, observation_start="2020-01-01")
+            out[sid] = get_fred_series(sid, observation_start="1990-01-01")
         except Exception:
             out[sid] = pd.Series(dtype=float, name=sid)
     return out
@@ -563,8 +574,8 @@ with st.sidebar:
 
     chart_lookback = st.selectbox(
         "Chart lookback",
-        options=["6M", "1Y", "2Y"],
-        index=1
+        options=LOOKBACK_OPTIONS,
+        index=3
     )
 
     show_group_table = st.checkbox("Show component table in charts", value=True)
@@ -575,7 +586,7 @@ with st.sidebar:
 yf_symbols = [x["symbol"] for x in MARKET_ASSETS]
 
 try:
-    yf_hist = get_yf_history(yf_symbols, period="2y")
+    yf_hist = get_yf_history(yf_symbols, period="max")
 except Exception as e:
     st.error(f"Failed to load Yahoo Finance data: {e}")
     yf_hist = pd.DataFrame()
@@ -668,7 +679,7 @@ with tab2:
     if not selected_groups:
         st.info("Please select at least one group in the sidebar.")
     else:
-        lookback_days = {"6M": 180, "1Y": 365, "2Y": 730}[chart_lookback]
+        lookback_days = LOOKBACK_MAP[chart_lookback]
 
         grouped_data = build_grouped_chart_data(
             yf_hist=yf_hist,
@@ -707,7 +718,7 @@ with tab2:
                 y="Value",
                 color="Series",
                 hover_name="Asset",
-                title=f"{grp} — All Items"
+                title=f"{grp} — All Items ({chart_lookback})"
             )
 
             fig.update_layout(
@@ -756,12 +767,20 @@ with tab3:
 - Market prices use **% change**
 - FRED macro / rate series use **absolute change**
 - Tab 2 shows **grouped signal charts**
+- Chart lookback supports **1M / 3M / 6M / 1Y / 5Y / 10Y / 20Y**
         """
     )
 
     st.markdown("### Series map")
     series_map = pd.DataFrame(MARKET_ASSETS + FRED_SERIES)
     st.dataframe(series_map, use_container_width=True, hide_index=True)
+
+    st.markdown("### Lookback map")
+    lookback_df = pd.DataFrame({
+        "Option": list(LOOKBACK_MAP.keys()),
+        "Days": list(LOOKBACK_MAP.values())
+    })
+    st.dataframe(lookback_df, use_container_width=True, hide_index=True)
 
     st.markdown("### Latest processed dataset")
     if not market_df.empty:
