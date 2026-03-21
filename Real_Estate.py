@@ -32,26 +32,28 @@ LOOKBACK_OPTIONS = {
     "3Y": relativedelta(years=3),
     "5Y": relativedelta(years=5),
     "10Y": relativedelta(years=10),
+    "20Y": relativedelta(years=20),
 }
 
 DEFAULT_SERIES = {
     "Rates": [
-        "FEDFUNDS",   # Effective Federal Funds Rate
-        "DGS2",       # 2-Year Treasury
-        "DGS10",      # 10-Year Treasury
-        "T10Y2Y",     # 10Y-2Y Spread
-        "MORTGAGE30US",  # 30-Year Mortgage Rate
+        "FEDFUNDS",       # Effective Federal Funds Rate
+        "DGS2",           # 2-Year Treasury
+        "DGS10",          # 10-Year Treasury
+        "T10Y2Y",         # 10Y-2Y Spread
+        "MORTGAGE30US",   # 30-Year Mortgage Rate
+        "DFII10",         # 10Y Real Yield
+        "T10YIE",         # 10Y Breakeven Inflation
     ],
     "Liquidity": [
-        "M2SL",       # M2 Money Supply
-        "WALCL",      # Fed Balance Sheet
+        "M2SL",           # M2 Money Supply
+        "WALCL",          # Fed Balance Sheet
     ],
     "Assets": [
-        "SP500",      # S&P 500
-        "NASDAQCOM",  # Nasdaq Composite
-        "CSUSHPINSA", # Case-Shiller US Home Price Index
-        "GOLDAMGBD228NLBM",  # Gold
-        "DEXUSEU",    # USD per EUR
+        "SP500",          # S&P 500
+        "NASDAQCOM",      # Nasdaq Composite
+        "CSUSHPINSA",     # Case-Shiller US Home Price Index
+        "DEXUSEU",        # USD per EUR
     ],
     "Credit / Risk": [
         "BAMLH0A0HYM2",   # High Yield OAS
@@ -66,12 +68,13 @@ SERIES_NOTES = {
     "DGS10": "US 10Y Treasury yield",
     "T10Y2Y": "10Y minus 2Y Treasury spread",
     "MORTGAGE30US": "30Y US mortgage rate",
+    "DFII10": "10Y TIPS / real yield",
+    "T10YIE": "10Y breakeven inflation",
     "M2SL": "M2 money stock",
     "WALCL": "Federal Reserve total assets",
     "SP500": "S&P 500 index",
     "NASDAQCOM": "Nasdaq Composite index",
     "CSUSHPINSA": "US national home price index",
-    "GOLDAMGBD228NLBM": "Gold price",
     "DEXUSEU": "USD per EUR",
     "BAMLH0A0HYM2": "US high yield spread",
     "VIXCLS": "VIX",
@@ -167,12 +170,20 @@ def build_master_dataframe(
     end_date: str,
 ) -> pd.DataFrame:
     data = []
+    failed_series = []
+
     for sid in series_ids:
         try:
             s = fred_get_observations(api_key, sid, start_date, end_date)
-            data.append(s)
+            if not s.empty:
+                data.append(s)
+            else:
+                failed_series.append(f"{sid} (empty)")
         except Exception as e:
-            st.warning(f"{sid} 로드 실패: {e}")
+            failed_series.append(f"{sid} ({e})")
+
+    if failed_series:
+        st.warning("일부 시리즈 로드 실패:\n\n" + "\n".join(f"- {x}" for x in failed_series))
 
     if not data:
         return pd.DataFrame()
@@ -186,12 +197,15 @@ def build_master_dataframe(
 def normalize_to_100(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for col in out.columns:
-        first_valid = out[col].dropna()
-        if first_valid.empty:
+        valid = out[col].dropna()
+        if valid.empty:
             out[col] = pd.NA
         else:
-            base = first_valid.iloc[0]
-            out[col] = out[col] / base * 100.0
+            base = valid.iloc[0]
+            if base == 0:
+                out[col] = pd.NA
+            else:
+                out[col] = out[col] / base * 100.0
     return out
 
 
@@ -226,17 +240,20 @@ def latest_snapshot_table(df: pd.DataFrame, meta_map: Dict[str, FredSeriesMeta])
         latest = s.iloc[-1]
         latest_date = s.index[-1].date()
 
+        meta = meta_map.get(col, FredSeriesMeta(col, col, "", ""))
+
         row = {
             "Series": col,
-            "Title": meta_map.get(col, FredSeriesMeta(col, col, "", "")).title,
+            "Title": meta.title,
             "Latest": latest,
             "Latest Date": str(latest_date),
-            "Units": meta_map.get(col, FredSeriesMeta(col, col, "", "")).units,
+            "Units": meta.units,
             "1M %": compute_change(s, LOOKBACK_OPTIONS["1M"]),
             "3M %": compute_change(s, LOOKBACK_OPTIONS["3M"]),
             "6M %": compute_change(s, LOOKBACK_OPTIONS["6M"]),
             "1Y %": compute_change(s, LOOKBACK_OPTIONS["1Y"]),
             "5Y %": compute_change(s, LOOKBACK_OPTIONS["5Y"]),
+            "10Y %": compute_change(s, LOOKBACK_OPTIONS["10Y"]),
         }
         rows.append(row)
 
@@ -244,7 +261,8 @@ def latest_snapshot_table(df: pd.DataFrame, meta_map: Dict[str, FredSeriesMeta])
     if snap.empty:
         return snap
 
-    for c in ["Latest", "1M %", "3M %", "6M %", "1Y %", "5Y %"]:
+    numeric_cols = ["Latest", "1M %", "3M %", "6M %", "1Y %", "5Y %", "10Y %"]
+    for c in numeric_cols:
         if c in snap.columns:
             snap[c] = pd.to_numeric(snap[c], errors="coerce")
 
@@ -257,7 +275,7 @@ def format_snapshot(df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     out["Latest"] = out["Latest"].map(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
-    for c in ["1M %", "3M %", "6M %", "1Y %", "5Y %"]:
+    for c in ["1M %", "3M %", "6M %", "1Y %", "5Y %", "10Y %"]:
         out[c] = out[c].map(lambda x: f"{x:+.2f}%" if pd.notna(x) else "")
     return out
 
@@ -309,12 +327,23 @@ def make_dual_axis_plot(df: pd.DataFrame, left_series: str, right_series: str, t
     return fig
 
 
+def build_group_map(selected_groups: List[str]) -> Dict[str, List[str]]:
+    return {grp: DEFAULT_SERIES[grp] for grp in selected_groups}
+
+
+def get_series_candidates(df: pd.DataFrame, candidates: List[str]) -> List[str]:
+    return [c for c in candidates if c in df.columns and df[c].dropna().shape[0] > 5]
+
+
 # =========================================================
-# Sidebar
+# Main title
 # =========================================================
 st.title("FRED Macro Dashboard")
 st.caption("금리 + 자산 + 유동성 자동 대시보드")
 
+# =========================================================
+# Sidebar
+# =========================================================
 with st.sidebar:
     st.header("Settings")
 
@@ -374,8 +403,14 @@ with st.spinner("시리즈 메타데이터 로드 중..."):
     for sid in selected_series:
         try:
             meta_map[sid] = fred_get_series_meta(api_key, sid)
-        except Exception as e:
-            st.warning(f"{sid} 메타데이터 로드 실패: {e}")
+        except Exception:
+            # 메타데이터 실패해도 observations 로드만 되면 계속 사용 가능
+            meta_map[sid] = FredSeriesMeta(
+                series_id=sid,
+                title=sid,
+                units="",
+                frequency="",
+            )
 
 # =========================================================
 # Load observations
@@ -393,7 +428,7 @@ if df.empty:
     st.stop()
 
 # =========================================================
-# Top metrics
+# Snapshot Table
 # =========================================================
 st.subheader("Market Snapshot")
 
@@ -403,8 +438,11 @@ snap_fmt = format_snapshot(snap_raw)
 if snap_fmt.empty:
     st.warning("스냅샷을 생성할 수 없습니다.")
 else:
-    styled = snap_fmt.style.map(color_signal, subset=["1M %", "3M %", "6M %", "1Y %", "5Y %"])
-    st.dataframe(styled, use_container_width=True, height=420)
+    styled = snap_fmt.style.map(
+        color_signal,
+        subset=["1M %", "3M %", "6M %", "1Y %", "5Y %", "10Y %"],
+    )
+    st.dataframe(styled, use_container_width=True, height=450)
 
 # =========================================================
 # Main time-series chart
@@ -436,45 +474,112 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # =========================================================
+# Grouped Charts
+# =========================================================
+st.subheader("Grouped Signal Charts")
+
+group_map = build_group_map(selected_groups)
+
+for grp_name, grp_series in group_map.items():
+    group_cols = [c for c in grp_series if c in chart_df.columns]
+    if not group_cols:
+        continue
+
+    gfig = go.Figure()
+    for col in group_cols:
+        gfig.add_trace(
+            go.Scatter(
+                x=chart_df.index,
+                y=chart_df[col],
+                mode="lines",
+                name=col,
+            )
+        )
+
+    gfig.update_layout(
+        title=f"{grp_name} - {'Normalized to 100' if normalize_chart else 'Raw Levels'}",
+        xaxis_title="Date",
+        yaxis_title="Index=100" if normalize_chart else "Level",
+        hovermode="x unified",
+        height=450,
+        legend=dict(orientation="h", y=1.08),
+    )
+    st.plotly_chart(gfig, use_container_width=True)
+
+# =========================================================
 # Focus panels
 # =========================================================
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Rates vs Assets")
-    possible_left = [c for c in df.columns if c in ["FEDFUNDS", "DGS2", "DGS10", "T10Y2Y", "MORTGAGE30US"]]
-    possible_right = [c for c in df.columns if c in ["SP500", "NASDAQCOM", "CSUSHPINSA", "GOLDAMGBD228NLBM"]]
+
+    possible_left = get_series_candidates(
+        df,
+        ["FEDFUNDS", "DGS2", "DGS10", "T10Y2Y", "MORTGAGE30US", "DFII10", "T10YIE"],
+    )
+    possible_right = get_series_candidates(
+        df,
+        ["SP500", "NASDAQCOM", "CSUSHPINSA", "DEXUSEU"],
+    )
 
     if possible_left and possible_right:
         left_series = st.selectbox("Left axis", possible_left, index=0)
         right_series = st.selectbox("Right axis", possible_right, index=0)
-        dual_fig = make_dual_axis_plot(df[[left_series, right_series]].dropna(), left_series, right_series, "Rates vs Assets")
-        st.plotly_chart(dual_fig, use_container_width=True)
+
+        dual_df = df[[left_series, right_series]].dropna()
+        if not dual_df.empty:
+            dual_fig = make_dual_axis_plot(
+                dual_df,
+                left_series,
+                right_series,
+                "Rates vs Assets",
+            )
+            st.plotly_chart(dual_fig, use_container_width=True)
+        else:
+            st.info("선택한 두 시리즈의 공통 데이터가 부족합니다.")
     else:
         st.info("금리 1개 + 자산 1개를 선택하면 비교 가능합니다.")
 
 with col2:
     st.subheader("Liquidity vs Assets")
-    liq_candidates = [c for c in df.columns if c in ["M2SL", "WALCL"]]
-    asset_candidates = [c for c in df.columns if c in ["SP500", "NASDAQCOM", "CSUSHPINSA", "GOLDAMGBD228NLBM"]]
+
+    liq_candidates = get_series_candidates(df, ["M2SL", "WALCL"])
+    asset_candidates = get_series_candidates(df, ["SP500", "NASDAQCOM", "CSUSHPINSA", "DEXUSEU"])
 
     if liq_candidates and asset_candidates:
         left_series2 = st.selectbox("Liquidity axis", liq_candidates, index=0)
         right_series2 = st.selectbox("Asset axis", asset_candidates, index=0)
-        dual_fig2 = make_dual_axis_plot(df[[left_series2, right_series2]].dropna(), left_series2, right_series2, "Liquidity vs Assets")
-        st.plotly_chart(dual_fig2, use_container_width=True)
+
+        dual_df2 = df[[left_series2, right_series2]].dropna()
+        if not dual_df2.empty:
+            dual_fig2 = make_dual_axis_plot(
+                dual_df2,
+                left_series2,
+                right_series2,
+                "Liquidity vs Assets",
+            )
+            st.plotly_chart(dual_fig2, use_container_width=True)
+        else:
+            st.info("선택한 두 시리즈의 공통 데이터가 부족합니다.")
     else:
         st.info("유동성 1개 + 자산 1개를 선택하면 비교 가능합니다.")
 
 # =========================================================
-# Correlation
+# Rolling Correlation
 # =========================================================
 st.subheader("Rolling Correlation")
 
 corr_candidates = [c for c in df.columns if df[c].dropna().shape[0] > rolling_corr_window + 5]
+
 if len(corr_candidates) >= 2:
     corr_a = st.selectbox("Series A", corr_candidates, index=0, key="corr_a")
-    corr_b = st.selectbox("Series B", corr_candidates, index=min(1, len(corr_candidates)-1), key="corr_b")
+    corr_b = st.selectbox(
+        "Series B",
+        corr_candidates,
+        index=min(1, len(corr_candidates) - 1),
+        key="corr_b",
+    )
 
     tmp = df[[corr_a, corr_b]].dropna().copy()
     tmp["ret_a"] = tmp[corr_a].pct_change()
@@ -501,14 +606,22 @@ else:
 # =========================================================
 st.subheader("Scatter: Rate / Liquidity / Asset Regime")
 
-scatter_x_candidates = [c for c in df.columns if c in selected_series]
-scatter_y_candidates = [c for c in df.columns if c in selected_series]
-scatter_color_candidates = [c for c in df.columns if c in selected_series]
+scatter_candidates = [c for c in df.columns if c in selected_series]
 
-if len(scatter_x_candidates) >= 2:
-    x_col = st.selectbox("X axis", scatter_x_candidates, index=0, key="scatter_x")
-    y_col = st.selectbox("Y axis", scatter_y_candidates, index=min(1, len(scatter_y_candidates)-1), key="scatter_y")
-    color_col = st.selectbox("Color", scatter_color_candidates, index=min(2, len(scatter_color_candidates)-1), key="scatter_c")
+if len(scatter_candidates) >= 2:
+    x_col = st.selectbox("X axis", scatter_candidates, index=0, key="scatter_x")
+    y_col = st.selectbox(
+        "Y axis",
+        scatter_candidates,
+        index=min(1, len(scatter_candidates) - 1),
+        key="scatter_y",
+    )
+    color_col = st.selectbox(
+        "Color",
+        scatter_candidates,
+        index=min(2, len(scatter_candidates) - 1),
+        key="scatter_c",
+    )
 
     scatter_df = df[[x_col, y_col, color_col]].dropna().copy()
     scatter_df["date"] = scatter_df.index.strftime("%Y-%m-%d")
@@ -528,21 +641,15 @@ if len(scatter_x_candidates) >= 2:
         st.info("선택한 시리즈의 공통 데이터가 부족합니다.")
 
 # =========================================================
-# Raw data expander
-# =========================================================
-with st.expander("Raw Data"):
-    st.dataframe(df.tail(300), use_container_width=True)
-
-# =========================================================
-# Interpretation helper
+# Quick Signal Box
 # =========================================================
 st.subheader("Quick Interpretation")
 
 interp_lines = []
 
 if "DGS10" in df.columns and "SP500" in df.columns:
-    dgs10_3m = compute_change(df["DGS10"].dropna(), LOOKBACK_OPTIONS["3M"])
-    sp500_3m = compute_change(df["SP500"].dropna(), LOOKBACK_OPTIONS["3M"])
+    dgs10_3m = compute_change(df["DGS10"], LOOKBACK_OPTIONS["3M"])
+    sp500_3m = compute_change(df["SP500"], LOOKBACK_OPTIONS["3M"])
     if dgs10_3m is not None and sp500_3m is not None:
         if dgs10_3m > 0 and sp500_3m > 0:
             interp_lines.append("- 금리 상승과 주가 상승이 동시에 진행 중: 할인율 부담 대비 자산 강세 구간")
@@ -552,8 +659,8 @@ if "DGS10" in df.columns and "SP500" in df.columns:
             interp_lines.append("- 금리 하락과 주가 상승 동행: 완화 기대 또는 유동성 회복 구간")
 
 if "M2SL" in df.columns and "SP500" in df.columns:
-    m2_1y = compute_change(df["M2SL"].dropna(), LOOKBACK_OPTIONS["1Y"])
-    sp_1y = compute_change(df["SP500"].dropna(), LOOKBACK_OPTIONS["1Y"])
+    m2_1y = compute_change(df["M2SL"], LOOKBACK_OPTIONS["1Y"])
+    sp_1y = compute_change(df["SP500"], LOOKBACK_OPTIONS["1Y"])
     if m2_1y is not None and sp_1y is not None:
         if m2_1y > 0 and sp_1y > 0:
             interp_lines.append("- 유동성과 주가가 함께 증가: 자산시장에 우호적")
@@ -561,16 +668,40 @@ if "M2SL" in df.columns and "SP500" in df.columns:
             interp_lines.append("- 유동성 둔화에도 주가 강세: 밸류에이션 확장 가능성 점검 필요")
 
 if "CSUSHPINSA" in df.columns and "MORTGAGE30US" in df.columns:
-    mort_1y = compute_change(df["MORTGAGE30US"].dropna(), LOOKBACK_OPTIONS["1Y"])
-    home_1y = compute_change(df["CSUSHPINSA"].dropna(), LOOKBACK_OPTIONS["1Y"])
+    mort_1y = compute_change(df["MORTGAGE30US"], LOOKBACK_OPTIONS["1Y"])
+    home_1y = compute_change(df["CSUSHPINSA"], LOOKBACK_OPTIONS["1Y"])
     if mort_1y is not None and home_1y is not None:
         if mort_1y > 0 and home_1y > 0:
             interp_lines.append("- 모기지 금리 상승에도 주택가격 상승 지속: 공급 부족 또는 후행 반응 가능성")
         elif mort_1y > 0 and home_1y < 0:
             interp_lines.append("- 모기지 금리 상승과 주택가격 하락 동행: 전형적인 부동산 압박 구간")
 
+if "DFII10" in df.columns and "T10YIE" in df.columns:
+    real_3m = compute_change(df["DFII10"], LOOKBACK_OPTIONS["3M"])
+    breakeven_3m = compute_change(df["T10YIE"], LOOKBACK_OPTIONS["3M"])
+    if real_3m is not None and breakeven_3m is not None:
+        if real_3m < 0 and breakeven_3m > 0:
+            interp_lines.append("- 실질금리 하락 + 기대인플레이션 상승: 인플레이션 헤지 자산에 우호적")
+        elif real_3m > 0 and breakeven_3m < 0:
+            interp_lines.append("- 실질금리 상승 + 기대인플레이션 하락: 위험자산/실물자산 부담 가능성")
+
+if "BAMLH0A0HYM2" in df.columns and "SP500" in df.columns:
+    hy_3m = compute_change(df["BAMLH0A0HYM2"], LOOKBACK_OPTIONS["3M"])
+    sp_3m = compute_change(df["SP500"], LOOKBACK_OPTIONS["3M"])
+    if hy_3m is not None and sp_3m is not None:
+        if hy_3m > 0 and sp_3m < 0:
+            interp_lines.append("- 하이일드 스프레드 확대 + 주가 약세: 신용 스트레스 구간")
+        elif hy_3m < 0 and sp_3m > 0:
+            interp_lines.append("- 하이일드 스프레드 축소 + 주가 강세: 리스크온 환경")
+
 if interp_lines:
     for line in interp_lines:
         st.write(line)
 else:
     st.write("- 선택한 시리즈 조합으로 자동 해석 문장을 만들기에는 데이터가 부족합니다.")
+
+# =========================================================
+# Raw data
+# =========================================================
+with st.expander("Raw Data"):
+    st.dataframe(df.tail(300), use_container_width=True)
